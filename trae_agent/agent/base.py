@@ -17,21 +17,53 @@ from .agent_basics import AgentExecution, AgentState, AgentStep
 class Agent(ABC):
     """Base class for LLM-based agents."""
 
-    def __init__(self, config: Config):
-        self._llm_client: LLMClient = LLMClient(
-            config.default_provider, config.model_providers[config.default_provider]
-        )
-        self._max_steps: int = config.max_steps
-        self._model_parameters: ModelParameters = config.model_providers[config.default_provider]
+    def __init__(self, config: Config | None = None, llm_client: LLMClient | None = None):
+        """Initialize the agent.
+
+        Args:
+            config: Configuration object containing model parameters and other settings.
+                   Required if llm_client is not provided.
+            llm_client: Optional pre-configured LLMClient instance.
+                       If provided, it will be used instead of creating a new one from config.
+        """
+        if llm_client is None:
+            if config is None:
+                raise ValueError("Either config or llm_client must be provided")
+            self._llm_client = LLMClient(
+                config.default_provider,
+                config.model_providers[config.default_provider],
+                config.max_steps,
+            )
+            self._model_parameters = config.model_providers[config.default_provider]
+            self._max_steps = config.max_steps
+        else:
+            self._llm_client = llm_client
+            self._model_parameters = llm_client.model_parameters
+            self._max_steps = llm_client.max_steps
+
         self._initial_messages: list[LLMMessage] = []
         self._task: str = ""
         self._tools: list[Tool] = []
         self._tool_caller: ToolExecutor = ToolExecutor([])
-
         self._cli_console: CLIConsole | None = None
 
         # Trajectory recorder
         self._trajectory_recorder: TrajectoryRecorder | None = None
+
+    @classmethod
+    def from_config(cls, config: Config) -> "Agent":
+        """Create an agent instance from a configuration object.
+
+        This factory method provides the traditional config-based initialization
+        while allowing subclasses to customize the instantiation process.
+
+        Args:
+            config: Configuration object containing model parameters and other settings.
+
+        Returns:
+            An instance of the agent.
+        """
+        return cls(config=config)
 
     @property
     def llm_client(self) -> LLMClient:
@@ -105,6 +137,8 @@ class Agent(ABC):
 
         execution = AgentExecution(task=self._task, steps=[])
 
+        step: AgentStep | None = None
+
         try:
             messages = self._initial_messages
             step_number = 1
@@ -113,12 +147,11 @@ class Agent(ABC):
                 step = AgentStep(step_number=step_number, state=AgentState.THINKING)
 
                 try:
-                    # Get LLM response
                     step.state = AgentState.THINKING
-
                     # Display thinking state
                     self._update_cli_console(step)
 
+                    # Get LLM response
                     llm_response = self._llm_client.chat(
                         messages, self._model_parameters, self._tools
                     )
@@ -175,7 +208,8 @@ class Agent(ABC):
         execution.execution_time = time.time() - start_time
 
         # Display final summary
-        self._update_cli_console(step)
+        if step:
+            self._update_cli_console(step)
 
         return execution
 

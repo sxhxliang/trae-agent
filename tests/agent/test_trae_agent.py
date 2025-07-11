@@ -9,6 +9,7 @@ from trae_agent.agent.agent_basics import AgentError
 from trae_agent.agent.trae_agent import TraeAgent
 from trae_agent.utils.config import Config
 from trae_agent.utils.llm_basics import LLMResponse
+from trae_agent.utils.llm_client import LLMClient
 
 
 class TestTraeAgentExtended(unittest.TestCase):
@@ -42,6 +43,24 @@ class TestTraeAgentExtended(unittest.TestCase):
 
     def tearDown(self):
         self.llm_client_patcher.stop()
+
+    def test_init_with_mock_client(self):
+        """Test initializing TraeAgent with a mock client"""
+        # Create a mock LLMClient
+        mock_client = MagicMock(spec=LLMClient)
+        mock_client.model_parameters = self.config.model_providers["anthropic"]
+        mock_client._max_steps = 20
+
+        # Initialize TraeAgent with mock client
+        agent = TraeAgent(llm_client=mock_client)
+
+        # Verify agent initialization
+        self.assertIsNotNone(agent)
+        self.assertEqual(agent.llm_client, mock_client)
+        self.assertEqual(agent.model_parameters, mock_client.model_parameters)
+        self.assertEqual(agent.max_steps, mock_client.max_steps)
+        self.assertEqual(len(agent.initial_messages), 0)
+        self.assertEqual(len(agent.tools), 0)
 
     @patch("trae_agent.utils.trajectory_recorder.TrajectoryRecorder")
     def test_trajectory_setup(self, mock_recorder):
