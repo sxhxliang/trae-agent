@@ -77,59 +77,83 @@ impl TraeAgent {
     ///   (excluding test files) was generated.
     ///
     /// # Returns
-    /// A tuple `(bool, Option<String>)`:
-    /// * The boolean is `true` if the agent should stop, `false` otherwise.
-    /// * The `Option<String>` contains an error message to be sent to the LLM if stopping
-    ///   is premature due to a validation failure (e.g., empty patch when required).
+    /// A `StopReason` enum indicating why the agent should stop or if it should continue.
     fn fn_should_stop(
         llm_response: &LLMResponse,
         current_step_number: u32,
         max_steps: u32,
         must_patch: bool,
         project_path: Option<&str>,
-        base_commit: Option<&str>, // Added base_commit parameter
-    ) -> (bool, Option<String>) {
+        base_commit: Option<&str>,
+    ) -> super::base_agent::StopReason { // Changed return type
         if current_step_number >= max_steps {
             warn!("Max steps reached, forcing stop.");
-            return (true, None);
+            return super::base_agent::StopReason::MaxStepsReached;
         }
+
+        let mut completion_signaled_by_tool = false;
+        // Check for task_done tool call
         if let Some(tool_calls) = &llm_response.choices[0].message.tool_calls {
-            for tc in tool_calls {
-                if tc.function.name == "task_done" {
-                    info!("'task_done' tool called by LLM.");
-                    if must_patch {
-                        if let Some(proj_p) = project_path {
-                            match crate::utils::git_utils::get_git_diff(proj_p, base_commit) {
-                                // Use base_commit
-                                Ok(model_patch) => {
-                                    let patch = crate::utils::git_utils::remove_patches_to_tests(
-                                        &model_patch,
-                                    );
-                                    if patch.trim().is_empty() {
-                                        warn!("Task completion signaled with 'task_done', but 'must_patch' is true and generated patch is empty (after filtering tests). Task not considered done.");
-                                        return (false, Some("ERROR! Your Patch is empty. Please provide a patch that fixes the problem.".to_string()));
-                                    }
-                                    info!("Patch validation successful for 'task_done'.");
-                                    return (true, None); // Task done and patch is valid
-                                }
-                                Err(e) => {
-                                    error!("Failed to get git diff for patch validation: {}", e);
-                                    // Treat as patch validation failure, ask LLM to retry or fix
-                                    return (false, Some(format!("ERROR! Could not verify patch due to git diff error: {}. Please try the fix again.", e)));
-                                }
-                            }
-                        } else {
-                            warn!("'must_patch' is true, but no project_path is available for git diff. Assuming task not complete.");
-                            return (false, Some("ERROR! 'must_patch' is true, but project_path is not configured for diffing.".to_string()));
-                        }
-                    } else {
-                        // must_patch is false, so task_done is enough
-                        return (true, None);
-                    }
-                }
+            if tool_calls.iter().any(|tc| tc.function.name == "task_done") {
+                info!("'task_done' tool called by LLM.");
+                completion_signaled_by_tool = true;
             }
         }
-        (false, None) // Default: don't stop, no error message
+
+        // Check for textual completion cues (Python's llm_indicates_task_completed)
+        let mut completion_signaled_by_text = false;
+        if let Some(content) = &llm_response.choices[0].message.content {
+            let content_lower = content.to_lowercase();
+            let completion_indicators = [
+                "task completed",
+                "task finished",
+                "done",
+                "completed successfully",
+                "finished successfully",
+            ];
+            if completion_indicators.iter().any(|indicator| content_lower.contains(indicator)) {
+                info!("Textual completion cue detected in LLM response.");
+                completion_signaled_by_text = true;
+            }
+        }
+
+        if completion_signaled_by_tool || completion_signaled_by_text {
+            // If must_patch is true, validate the patch
+            if must_patch {
+                if let Some(proj_p) = project_path {
+                    match crate::utils::git_utils::get_git_diff(proj_p, base_commit) {
+                        Ok(model_patch) => {
+                            let patch = crate::utils::git_utils::remove_patches_to_tests(&model_patch);
+                            if patch.trim().is_empty() {
+                                warn!("Completion signaled (tool or text), but 'must_patch' is true and generated patch is empty. Task not considered done.");
+                                return super::base_agent::StopReason::ValidationFailed(
+                                    "ERROR! Your Patch is empty. Please provide a patch that fixes the problem.".to_string(),
+                                );
+                            }
+                            info!("Patch validation successful for completion signal.");
+                            return super::base_agent::StopReason::TaskCompleted;
+                        }
+                        Err(e) => {
+                            error!("Failed to get git diff for patch validation: {}", e);
+                            return super::base_agent::StopReason::ValidationFailed(format!(
+                                "ERROR! Could not verify patch due to git diff error: {}. Please try the fix again.",
+                                e
+                            ));
+                        }
+                    }
+                } else {
+                    warn!("'must_patch' is true, but no project_path is available for git diff. Assuming task not complete.");
+                    return super::base_agent::StopReason::ValidationFailed(
+                        "ERROR! 'must_patch' is true, but project_path is not configured for diffing.".to_string(),
+                    );
+                }
+            } else {
+                // must_patch is false, so tool call or text cue is enough
+                return super::base_agent::StopReason::TaskCompleted;
+            }
+        }
+
+        super::base_agent::StopReason::Continue // Default: don't stop
     }
 
     /// Processes the LLM's response to extract a final message when the task is considered complete.
@@ -164,49 +188,84 @@ impl TraeAgent {
         llm_response: &LLMResponse,
         current_step_in_turn: u32, // This is the step number within common_execute_task_loop
         max_steps_for_turn: u32,   // Max steps for this specific interactive turn (e.g., 2)
-    ) -> (bool, Option<String>) {
+    ) -> super::base_agent::StopReason { // Changed return type
         if current_step_in_turn >= max_steps_for_turn {
-            return (true, None); // Reached max micro-steps for this turn
+            return super::base_agent::StopReason::TaskCompleted; // Turn considered "complete" by reaching its micro-step limit
         }
 
         let message = &llm_response.choices[0].message;
         if message.tool_calls.is_none()
             || message.tool_calls.as_ref().map_or(true, |tc| tc.is_empty())
         {
-            // If there are no tool calls, this is a direct response to the user, so stop.
-            return (true, None);
+            // If there are no tool calls, this is a direct response to the user, so the turn is "complete".
+            return super::base_agent::StopReason::TaskCompleted;
         }
 
-        // If there ARE tool calls, we don't stop yet. We want to execute them and get one more LLM response.
-        // The max_steps_for_turn (e.g., 2) will handle stopping after tools + next LLM response.
-        // If current_step_in_turn is 1 and there are tool calls, we'll proceed to step 2.
-        // If current_step_in_turn is 2 (meaning tools were called in step 1, and this is LLM response after tools), we stop.
-        if current_step_in_turn >= 1
-            && (message.tool_calls.is_some() && !message.tool_calls.as_ref().unwrap().is_empty())
-        {
-            // This condition means: if we are past the first step AND there are tool calls,
-            // we let max_steps_for_turn (e.g. 2) handle it.
-            // If on step 1, and there are tool calls, we continue.
-            // If on step 2 (meaning step 1 had tool calls), we stop regardless of this response.
-            // This logic is simplified by simply checking current_step_in_turn >= max_steps_for_turn above.
+        // If it's the first step (current_step_in_turn == 1) and there ARE tool calls, we want to continue.
+        if current_step_in_turn == 1 && message.tool_calls.is_some() && !message.tool_calls.as_ref().unwrap().is_empty() {
+            return super::base_agent::StopReason::Continue;
         }
 
-        // If it's the first step in the turn (current_step_in_turn == 1) and there are tool calls,
-        // we want to continue to execute tools and get the next LLM response.
-        // If it's a later step (e.g. current_step_in_turn == 2, meaning tools were just executed),
-        // then we should stop with this LLM response.
-        if current_step_in_turn > 1 && message.tool_calls.is_some() {
-            // This LLM response came after tool execution. Stop now.
-            return (true, None);
+        // If it's past the first step (e.g., current_step_in_turn == 2, meaning tools were just run from step 1),
+        // then this LLM response is the one after tool execution. The turn should be considered "complete".
+        // This also covers cases where max_steps_for_turn might be > 2, but we typically want to stop after one round of tool calls.
+        // The check for current_step_in_turn >= max_steps_for_turn already handles the absolute limit.
+        if current_step_in_turn > 1 { // Implicitly, this means tools were likely called in a previous micro-step
+            return super::base_agent::StopReason::TaskCompleted;
         }
 
-        (false, None) // Default: continue if within max_steps_for_turn and tools were just called on step 1.
+        // Default for any other scenario (though the logic above should cover typical interactive turn patterns)
+        super::base_agent::StopReason::Continue
     }
 
     /// Processes the LLM's response for an interactive turn to get the assistant's message.
     fn fn_extract_assistant_response_interactive(llm_response: &LLMResponse) -> Option<String> {
         // For interactive mode, the "final result" is simply the assistant's content.
         llm_response.choices[0].message.content.clone()
+    }
+
+    /// Saves the git diff to the specified patch_path if configured.
+    fn save_git_patch_if_needed(&self) -> Result<(), AgentError> {
+        if let Some(patch_path_str) = &self.base_agent.patch_path {
+            if let Some(project_path_str) = &self.base_agent.project_path {
+                info!(
+                    "Attempting to save git diff to patch_path: {}",
+                    patch_path_str
+                );
+                match crate::utils::git_utils::get_git_diff(
+                    project_path_str,
+                    self.base_agent.base_commit.as_deref(),
+                ) {
+                    Ok(diff_content) => {
+                        match std::fs::write(patch_path_str, diff_content) {
+                            Ok(_) => {
+                                info!("Successfully saved git diff to {}", patch_path_str);
+                            }
+                            Err(e) => {
+                                error!("Failed to write patch file to {}: {}", patch_path_str, e);
+                                // Decide if this should be a critical error for the agent's task
+                                // For now, just log it, as the main task might have succeeded.
+                                // Could also return an error:
+                                // return Err(AgentError::ToolError(crate::tools::ToolError::FileWriteError(format!("Failed to write patch to {}: {}", patch_path_str, e))));
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!(
+                            "Failed to get git diff for saving to patch_path {}: {}",
+                            patch_path_str, e
+                        );
+                        // return Err(AgentError::ToolError(crate::tools::ToolError::InternalError(format!("Failed to get git diff: {}", e))));
+                    }
+                }
+            } else {
+                warn!(
+                    "patch_path ({}) is set, but project_path is not. Cannot save patch.",
+                    patch_path_str
+                );
+            }
+        }
+        Ok(())
     }
 }
 
@@ -255,6 +314,13 @@ impl Agent for TraeAgent {
                     debug!("Set base_commit to: {}", bc_str);
                 }
             }
+            if let Some(pp_val) = args.get("patch_path") {
+                if let Some(pp_str) = pp_val.as_str() {
+                    self.base_agent.patch_path = Some(pp_str.to_string());
+                    // Not typically needed for trajectory_extra_args, but can be added if desired
+                    debug!("Set patch_path to: {}", pp_str);
+                }
+            }
             // Add other relevant args to recorder_extra_args if needed
             recorder_extra_args.insert("must_patch".to_string(), self.base_agent.must_patch.to_string());
         }
@@ -278,14 +344,37 @@ impl Agent for TraeAgent {
             tool_call_id: None,
         });
 
-        let mut user_message_content = format!("[Problem statement]: {}\n", task);
-        if let Some(project_path) = &self.base_agent.project_path {
-            user_message_content.push_str(&format!("[Project root path]: {}\n", project_path));
+        let mut user_message_content = String::new();
+        let problem_statement_text = if let Some(args_val) = &task_args {
+            if let Some(issue_val) = args_val.get("issue") {
+                issue_val.as_str().map(|s| s.to_string())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
+        if let Some(issue_text) = problem_statement_text {
+            user_message_content.push_str(&format!(
+                "[Problem statement]: We're currently solving the following issue within our repository. Here's the issue text:\n{}\n",
+                issue_text
+            ));
+        } else {
+            // Fallback to using the main task string if 'issue' is not provided
+            user_message_content.push_str(&format!("[Problem statement]: {}\n", task));
         }
+
+        if let Some(project_path) = &self.base_agent.project_path {
+            user_message_content.push_str(&format!("\n[Project root path]: {}\n", project_path));
+        }
+        // Ensure there's a blank line if both problem statement and project path are present.
+        // The format! macro for project_path already adds a newline at the start if user_message_content is not empty.
+
 
         self.base_agent.conversation_history.push(LLMMessage {
             role: MessageRole::User,
-            content: Some(user_message_content),
+            content: Some(user_message_content.trim_end().to_string() + "\n"), // Ensure single trailing newline
             name: None,
             tool_calls: None,
             tool_call_id: None,
@@ -325,7 +414,7 @@ impl Agent for TraeAgent {
         let project_path_cloned_opt: Option<String> = self.base_agent.project_path.clone();
         let base_commit_cloned_opt: Option<String> = self.base_agent.base_commit.clone();
 
-        common_execute_task_loop(
+        let execution_result = common_execute_task_loop(
             &mut self.base_agent,
             initial_messages_clone,
             event_sender,
@@ -342,7 +431,16 @@ impl Agent for TraeAgent {
             },
             &|llm_response| TraeAgent::fn_process_llm_response_for_completion(llm_response),
         )
-        .await
+        .await;
+
+        // After task execution, try to save the patch if configured
+        if let Err(e) = self.save_git_patch_if_needed() {
+            // Log the error, but don't necessarily make the whole task fail due to patch saving error.
+            // The main execution result is more important.
+            warn!("Failed to save git patch (if configured): {:?}", e);
+        }
+
+        execution_result
     }
 
     async fn execute_interactive_turn(
@@ -511,5 +609,273 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("[Project root path]: /test/path"));
+    }
+
+    // Tests for fn_should_stop
+    mod test_fn_should_stop {
+        use super::*; // To get TraeAgent and its methods, LLMResponse etc.
+        use crate::agent::base_agent::StopReason;
+        // Corrected imports based on llm/base_client.rs
+        use crate::llm::base_client::{LLMMessage, LLMResponse, LLMResponseChoice, ToolCall, ToolCallFunction};
+
+        fn mock_llm_response(content: Option<String>, tool_calls: Option<Vec<ToolCall>>) -> LLMResponse {
+            LLMResponse {
+                id: "test_response_id".to_string(),
+                object: "chat.completion".to_string(), // Added field
+                created: 0, // Added field, default to 0 for mock
+                model: "test_model".to_string(),
+                choices: vec![LLMResponseChoice { // Corrected type
+                    index: 0,
+                    message: LLMMessage {
+                        role: MessageRole::Assistant,
+                        content,
+                        name: None,
+                        tool_calls, // Uses corrected ToolCall type
+                        tool_call_id: None,
+                    },
+                    finish_reason: Some("stop".to_string()),
+                }],
+                usage: None,
+                // system_fingerprint: None, // Removed field
+            }
+        }
+
+        fn task_done_tool_call() -> ToolCall { // Corrected type
+            ToolCall { // Corrected type
+                id: "call_task_done_123".to_string(),
+                tool_type: "function".to_string(), // field name is tool_type
+                function: ToolCallFunction { // Corrected type
+                    name: "task_done".to_string(),
+                    arguments: "{}".to_string(),
+                },
+            }
+        }
+
+        #[test]
+        fn test_stop_max_steps_reached() {
+            let response = mock_llm_response(Some("hello".to_string()), None);
+            let reason = TraeAgent::fn_should_stop(&response, 5, 5, false, None, None);
+            assert_eq!(reason, StopReason::MaxStepsReached);
+        }
+
+        #[test]
+        fn test_stop_by_task_done_tool_no_patch_required() {
+            let response = mock_llm_response(None, Some(vec![task_done_tool_call()]));
+            let reason = TraeAgent::fn_should_stop(&response, 1, 5, false, None, None);
+            assert_eq!(reason, StopReason::TaskCompleted);
+        }
+
+        #[test]
+        fn test_stop_by_textual_completion_no_patch_required() {
+            let response = mock_llm_response(Some("The task completed successfully.".to_string()), None);
+            let reason = TraeAgent::fn_should_stop(&response, 1, 5, false, None, None);
+            assert_eq!(reason, StopReason::TaskCompleted);
+        }
+
+        #[test]
+        fn test_continue_if_no_completion_signal() {
+            let response = mock_llm_response(Some("Working on it.".to_string()), None);
+            let reason = TraeAgent::fn_should_stop(&response, 1, 5, false, None, None);
+            assert_eq!(reason, StopReason::Continue);
+        }
+
+        // More complex cases involving must_patch = true would require mocking git_utils.
+        // For now, these cover the non-patch-dependent parts of the logic.
+
+        #[test]
+        fn test_stop_by_task_done_must_patch_no_project_path() {
+            let response = mock_llm_response(None, Some(vec![task_done_tool_call()]));
+            let reason = TraeAgent::fn_should_stop(&response, 1, 5, true, None, None); // must_patch = true, no project_path
+            assert_eq!(
+                reason,
+                StopReason::ValidationFailed(
+                    "ERROR! 'must_patch' is true, but project_path is not configured for diffing."
+                        .to_string()
+                )
+            );
+        }
+
+        #[test]
+        fn test_stop_by_textual_completion_must_patch_no_project_path() {
+            let response = mock_llm_response(Some("Done.".to_string()), None);
+            let reason = TraeAgent::fn_should_stop(&response, 1, 5, true, None, None); // must_patch = true, no project_path
+             assert_eq!(
+                reason,
+                StopReason::ValidationFailed(
+                    "ERROR! 'must_patch' is true, but project_path is not configured for diffing."
+                        .to_string()
+                )
+            );
+        }
+
+        // To test patch validation success/failure, we'd need to mock:
+        // - crate::utils::git_utils::get_git_diff
+        // - crate::utils::git_utils::remove_patches_to_tests
+        // This is non-trivial for unit tests without a mocking framework or feature flags.
+        // We are testing the logic paths that lead *to* those calls here.
+    }
+
+    // TODO: Add tests for TraeAgent::new_task prompt formatting with 'issue'
+    #[cfg(test)]
+    mod test_new_task_prompt {
+        use super::*;
+        use serde_json::json;
+
+        #[tokio::test]
+        async fn test_new_task_with_issue_arg() {
+            let config = create_test_config(); // Assuming create_test_config is in outer scope
+            let tool_registry = create_test_tool_registry(); // Assuming create_test_tool_registry is in outer scope
+            let mut agent = TraeAgent::try_new(config, tool_registry, None)
+                .await
+                .unwrap();
+
+            let task_desc = "Overall task title".to_string();
+            let issue_text = "Specific bug description here.".to_string();
+            let project_path_text = "/test/project".to_string();
+
+            let task_args_val = json!({
+                "project_path": project_path_text,
+                "issue": issue_text
+            });
+
+            agent.new_task(task_desc.clone(), Some(task_args_val)).await.unwrap();
+
+            let user_message = agent.base_agent.conversation_history.iter().find(|m| m.role == MessageRole::User).unwrap();
+            let expected_problem_statement = format!("[Problem statement]: We're currently solving the following issue within our repository. Here's the issue text:\n{}\n", issue_text);
+            let expected_project_path_statement = format!("\n[Project root path]: {}\n", project_path_text);
+
+            assert!(user_message.content.as_ref().unwrap().contains(&expected_problem_statement));
+            assert!(user_message.content.as_ref().unwrap().contains(&expected_project_path_statement));
+            assert!(!user_message.content.as_ref().unwrap().contains(&task_desc)); // Task desc shouldn't be in problem statement if issue is used
+        }
+
+        #[tokio::test]
+        async fn test_new_task_without_issue_arg_fallback_to_task_desc() {
+            let config = create_test_config();
+            let tool_registry = create_test_tool_registry();
+            let mut agent = TraeAgent::try_new(config, tool_registry, None)
+                .await
+                .unwrap();
+
+            let task_desc = "Fix the login button".to_string();
+            let project_path_text = "/test/another/project".to_string();
+
+            let task_args_val = json!({
+                "project_path": project_path_text
+            }); // No "issue" field
+
+            agent.new_task(task_desc.clone(), Some(task_args_val)).await.unwrap();
+
+            let user_message = agent.base_agent.conversation_history.iter().find(|m| m.role == MessageRole::User).unwrap();
+            let expected_problem_statement = format!("[Problem statement]: {}\n", task_desc); // Fallback
+            let expected_project_path_statement = format!("\n[Project root path]: {}\n", project_path_text);
+
+            assert!(user_message.content.as_ref().unwrap().contains(&expected_problem_statement));
+            assert!(user_message.content.as_ref().unwrap().contains(&expected_project_path_statement));
+        }
+    }
+
+    #[cfg(test)]
+    mod test_patch_saving {
+        use super::*;
+        use serde_json::json;
+        use tempfile::tempdir;
+        use std::fs;
+        use std::path::Path;
+        use std::process::Command;
+
+        // Helper to init a git repo and make commits - adapted from git_utils tests
+        fn setup_initial_repo_for_diff(dir: &Path) -> Result<String, anyhow::Error> {
+            Command::new("git").arg("init").current_dir(dir).status()?;
+            Command::new("git").args(["config", "user.name", "Test User"]).current_dir(dir).status()?;
+            Command::new("git").args(["config", "user.email", "test@example.com"]).current_dir(dir).status()?;
+
+            fs::write(dir.join("file.txt"), "initial content")?;
+            Command::new("git").arg("add").arg("file.txt").current_dir(dir).status()?;
+            Command::new("git").arg("commit").arg("-m").arg("Initial commit").current_dir(dir).status()?;
+            let base_commit_hash = String::from_utf8(
+                Command::new("git").arg("rev-parse").arg("HEAD").current_dir(dir).output()?.stdout
+            )?.trim().to_string();
+
+            // Make the change that we want to see in the patch
+            fs::write(dir.join("file.txt"), "modified content")?;
+            // Commit this change so HEAD moves past base_commit
+            Command::new("git").arg("add").arg("file.txt").current_dir(dir).status()?;
+            Command::new("git").arg("commit").arg("-m").arg("Modified file.txt").current_dir(dir).status()?;
+
+            Ok(base_commit_hash) // Return the hash *before* the modification
+        }
+
+        #[tokio::test]
+        async fn test_patch_saving_successful() {
+            let project_dir = tempdir().unwrap();
+            let patch_dir = tempdir().unwrap();
+            let base_commit = setup_initial_repo_for_diff(project_dir.path()).unwrap();
+
+            let config = create_test_config();
+            let tool_registry = create_test_tool_registry();
+            let mut agent = TraeAgent::try_new(config, tool_registry, None).await.unwrap();
+
+            let patch_file_path = patch_dir.path().join("test.patch");
+            agent.base_agent.project_path = Some(project_dir.path().to_str().unwrap().to_string());
+            agent.base_agent.base_commit = Some(base_commit);
+            agent.base_agent.patch_path = Some(patch_file_path.to_str().unwrap().to_string());
+
+            agent.save_git_patch_if_needed().unwrap();
+
+            assert!(patch_file_path.exists());
+            let patch_content = fs::read_to_string(patch_file_path).unwrap();
+            assert!(patch_content.contains("--- a/file.txt"));
+            assert!(patch_content.contains("+++ b/file.txt"));
+            assert!(patch_content.contains("-initial content"));
+            assert!(patch_content.contains("+modified content"));
+        }
+
+        #[tokio::test]
+        async fn test_patch_saving_no_patch_path() {
+            let project_dir = tempdir().unwrap();
+            setup_initial_repo_for_diff(project_dir.path()).unwrap(); // Setup repo but don't need base_commit
+
+            let config = create_test_config();
+            let tool_registry = create_test_tool_registry();
+            let mut agent = TraeAgent::try_new(config, tool_registry, None).await.unwrap();
+
+            agent.base_agent.project_path = Some(project_dir.path().to_str().unwrap().to_string());
+            agent.base_agent.patch_path = None; // No patch path set
+
+            // This should do nothing and not panic
+            agent.save_git_patch_if_needed().unwrap();
+            // Assert no file was created (difficult to check universally, rely on no panic and code logic)
+        }
+
+        #[tokio::test]
+        async fn test_patch_saving_no_project_path() {
+            let patch_dir = tempdir().unwrap();
+            let patch_file_path = patch_dir.path().join("test.patch");
+
+            let config = create_test_config();
+            let tool_registry = create_test_tool_registry();
+            let mut agent = TraeAgent::try_new(config, tool_registry, None).await.unwrap();
+
+            agent.base_agent.project_path = None; // No project path
+            agent.base_agent.patch_path = Some(patch_file_path.to_str().unwrap().to_string());
+
+            // This should log a warning and not panic
+            agent.save_git_patch_if_needed().unwrap();
+            assert!(!patch_file_path.exists()); // File should not be created
+        }
+         #[tokio::test]
+        async fn test_new_task_parses_patch_path() {
+            let config = create_test_config();
+            let tool_registry = create_test_tool_registry();
+            let mut agent = TraeAgent::try_new(config, tool_registry, None).await.unwrap();
+
+            let task_args = json!({
+                "project_path": "/tmp/dummy",
+                "patch_path": "/tmp/output.patch"
+            });
+            agent.new_task("test".to_string(), Some(task_args)).await.unwrap();
+            assert_eq!(agent.base_agent.patch_path, Some("/tmp/output.patch".to_string()));
+        }
     }
 }

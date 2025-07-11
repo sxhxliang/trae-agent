@@ -221,6 +221,8 @@ pub struct BaseAgent {
     pub must_patch: bool,
     /// Optional base commit hash for diffing.
     pub base_commit: Option<String>,
+    /// Optional path to save the generated patch file.
+    pub patch_path: Option<String>, // Added for patch saving
     /// Optional trajectory recorder.
     pub trajectory_recorder: Option<TrajectoryRecorder>, // Added
 }
@@ -287,8 +289,9 @@ impl BaseAgent {
             max_steps: config.max_steps,
             project_path: config.working_dir.clone(),
             must_patch: false,
-            base_commit: None, // Initialize as None
-            trajectory_recorder: None, // Initialize as None
+            base_commit: None,
+            patch_path: None, // Initialize as None
+            trajectory_recorder: None,
         })
     }
 
@@ -306,6 +309,20 @@ impl BaseAgent {
 /// to drive its task execution. It manages the step-by-step interaction with the LLM,
 /// tool execution, state updates, and conversation history.
 ///
+// Define StopReason (can be moved to a separate types.rs if preferred)
+#[derive(Debug, Clone, PartialEq)]
+pub enum StopReason {
+    /// Agent should continue execution.
+    Continue,
+    /// Task successfully completed (e.g., by tool call or textual confirmation) and passed validation.
+    TaskCompleted,
+    /// Task considered complete by LLM/logic, but failed validation (e.g., empty patch).
+    /// Contains a message to be sent back to the LLM.
+    ValidationFailed(String),
+    /// Maximum execution steps reached.
+    MaxStepsReached,
+}
+
 /// # Type Parameters
 /// * `FShouldStop`: A closure type that determines if the agent should stop execution based on the LLM response and current state.
 /// * `FProcessCompletion`: A closure type that processes the final LLM response upon successful task completion.
@@ -314,9 +331,7 @@ impl BaseAgent {
 /// * `base_agent`: A mutable reference to the `BaseAgent` containing shared state.
 /// * `initial_messages`: The initial set of messages (e.g., system prompt, user task) to start the conversation.
 /// * `event_sender`: Optional sender for `AgentEvent`s to report progress.
-/// * `should_stop_fn`: Closure that takes `(&LLMResponse, current_step, max_steps)` and returns `(bool, Option<String>)`.
-///   The boolean indicates if execution should stop. The `Option<String>` provides an error message
-///   for the LLM if stopping is due to a validation failure (e.g., empty patch).
+/// * `should_stop_fn`: Closure that takes `(&LLMResponse, current_step, max_steps)` and returns `StopReason`.
 /// * `process_completion_fn`: Closure that takes `&LLMResponse` and returns `Option<String>` for the final result message.
 ///
 /// # Returns
@@ -329,7 +344,7 @@ pub async fn common_execute_task_loop<FShouldStop, FProcessCompletion>(
     process_completion_fn: &FProcessCompletion,
 ) -> Result<AgentExecution, AgentError>
 where
-    FShouldStop: Fn(&LLMResponse, u32, u32) -> (bool, Option<String>),
+    FShouldStop: Fn(&LLMResponse, u32, u32) -> StopReason,
     FProcessCompletion: Fn(&LLMResponse) -> Option<String>,
 {
     let task_name = base_agent
@@ -443,40 +458,64 @@ where
                     .conversation_history
                     .push(llm_response.choices[0].message.clone());
 
-                let (stop_signal, error_msg_for_llm) =
+                let stop_reason =
                     should_stop_fn(&llm_response, current_step_number, base_agent.max_steps);
 
-                if stop_signal {
-                    agent_step.state = AgentState::Completed;
-                    execution.success = true;
-                    execution.final_result = process_completion_fn(&llm_response);
-                    info!(task = %task_name, "Task marked completed by agent logic.");
-                    agent_step.duration_ms = step_start_time.elapsed().as_millis();
-                    execution.steps.push(agent_step);
-                    break;
-                } else if let Some(llm_err_msg) = error_msg_for_llm {
-                    // error_msg_for_llm is moved here
-                    warn!(task = %task_name, "Task completion validation failed: {}", llm_err_msg);
-                    base_agent.conversation_history.push(LLMMessage {
-                        role: MessageRole::User,
-                        content: Some(llm_err_msg), // llm_err_msg is used
-                        name: None,
-                        tool_calls: None,
-                        tool_call_id: None,
-                    });
-                    agent_step.state = AgentState::Thinking;
-                }
-
-                // If not stopping, check for tool calls (only if no validation error message was generated,
-                // as that message needs to go to LLM first).
-                // The error_msg_for_llm was moved in the `if let Some` above.
-                // We need to check its original value or restructure.
-                // Let's check if agent_step.state is still Thinking (i.e., didn't get a validation error message)
-                if agent_step.state == AgentState::Thinking {
-                    // Check if state was changed by validation error
-                    if let Some(tool_calls) = llm_response.choices[0].message.tool_calls.clone() {
-                        if !tool_calls.is_empty() {
-                            agent_step.state = AgentState::CallingTool;
+                match stop_reason {
+                    StopReason::TaskCompleted => {
+                        agent_step.state = AgentState::Completed;
+                        execution.success = true;
+                        execution.final_result = process_completion_fn(&llm_response);
+                        info!(task = %task_name, "Task marked completed by agent logic.");
+                        agent_step.duration_ms = step_start_time.elapsed().as_millis();
+                        execution.steps.push(agent_step);
+                        break; // Exit the main while loop
+                    }
+                    StopReason::ValidationFailed(validation_msg) => {
+                        warn!(task = %task_name, "Task completion validation failed: {}", validation_msg);
+                        base_agent.conversation_history.push(LLMMessage {
+                            role: MessageRole::User,
+                            content: Some(validation_msg),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
+                        agent_step.state = AgentState::Thinking; // Will continue to next LLM call
+                    }
+                    StopReason::MaxStepsReached => {
+                        // This case should ideally be caught by the loop condition,
+                        // but fn_should_stop also checks it. If it returns MaxStepsReached,
+                        // we treat it as a form of non-successful completion.
+                        // The main loop's condition `current_step_number <= base_agent.max_steps`
+                        // will handle breaking. This specific match arm might not be strictly
+                        // necessary if fn_should_stop only returns MaxStepsReached when current_step >= max_steps.
+                        // However, if fn_should_stop has other reasons to declare max steps (e.g. token limits),
+                        // then this is a clean way to stop. For now, assume it's primarily for loop termination.
+                        // The outer loop will break, and finalization logic will set error_message.
+                        // No specific action here other than letting the loop condition handle it.
+                        // The current fn_should_stop returns MaxStepsReached if current_step_number >= max_steps
+                        // So, if it's exactly max_steps, this iteration runs, fn_should_stop might return MaxStepsReached,
+                        // then current_step_number increments, and loop terminates.
+                        // If it's already > max_steps, loop wouldn't run.
+                        // For clarity, if MaxStepsReached is determined here, we can break.
+                        warn!(task = %task_name, "Max steps reached as per should_stop_fn.");
+                        // Let the main loop condition handle the break and subsequent error message.
+                        // If we break here, we need to ensure final_result/error_message is set appropriately.
+                        // The existing logic outside the loop handles MaxStepsReached error message.
+                        // So, we can simply let it flow, or break and ensure the message is set.
+                        // To be safe and explicit:
+                        execution.error_message = Some(AgentError::MaxStepsReached(base_agent.max_steps).to_string());
+                        agent_step.state = AgentState::Failed; // Or a new "MaxStepsExceeded" state
+                        agent_step.duration_ms = step_start_time.elapsed().as_millis();
+                        execution.steps.push(agent_step);
+                        break;
+                    }
+                    StopReason::Continue => {
+                        // Continue with tool call checks or other logic for this step
+                        let llm_message = &llm_response.choices[0].message;
+                        if let Some(tool_calls) = llm_message.tool_calls.clone() {
+                            if !tool_calls.is_empty() {
+                                agent_step.state = AgentState::CallingTool;
                             agent_step.tool_calls_made = Some(tool_calls.clone());
                             if let Some(sender) = &event_sender {
                                 _ = sender
@@ -532,18 +571,43 @@ where
                                 });
                             }
                             agent_step.state = AgentState::ProcessingToolResult;
+                        } else {
+                            // No tool calls, and StopReason was Continue.
+                            // This is where Python sends "It seems that you have not completed the task."
+                            debug!(
+                                step = current_step_number,
+                                "LLM provided text response without tool calls, and task is not yet complete. Re-prompting."
+                            );
+                            base_agent.conversation_history.push(LLMMessage {
+                                role: MessageRole::User,
+                                content: Some("It seems that you have not completed the task. Please try again or use a tool to signal completion.".to_string()),
+                                name: None,
+                                tool_calls: None,
+                                tool_call_id: None,
+                            });
+                            // agent_step.state remains Thinking or whatever it was before this specific sub-branch
+                            // if it was Thinking from the start of the match, it stays Thinking.
                         }
                     } else {
+                        // No tool_calls field in the message, and StopReason was Continue.
                         debug!(
                             step = current_step_number,
-                            "LLM provided text response, no tool calls."
+                            "LLM provided text response without tool calls (tool_calls field was None), and task is not yet complete. Re-prompting."
                         );
+                        base_agent.conversation_history.push(LLMMessage {
+                            role: MessageRole::User,
+                            content: Some("It seems that you have not completed the task. Please try again or use a tool to signal completion.".to_string()),
+                            name: None,
+                            tool_calls: None,
+                            tool_call_id: None,
+                        });
                     }
-                }
-            }
-            Err(e) => {
-                error!(step = current_step_number, error = %e, "LLM chat failed");
-                agent_step.state = AgentState::Failed;
+                } // Closes StopReason::Continue block
+            } // Closes match stop_reason
+        } // Closes Ok(llm_response) block
+        Err(e) => { // This is the Err arm for llm_response_result
+            error!(step = current_step_number, error = %e, "LLM chat failed");
+            agent_step.state = AgentState::Failed;
                 agent_step.error = Some(e.to_string());
                 execution.error_message = Some(e.to_string());
                 execution.success = false;
