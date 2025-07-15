@@ -194,9 +194,8 @@ trae-cli run "Comment this code" --provider ollama --model "qwen3"
 
 - `OPENAI_API_KEY` - OpenAI API key
 - `ANTHROPIC_API_KEY` - Anthropic API key
-- `GOOGLE_API_KEY` - Google API key
-- `OPENROUTER_API_KEY` - OpenRouter API key
 - `GOOGLE_API_KEY` - Google Gemini API key
+- `OPENROUTER_API_KEY` - OpenRouter API key
 - `OPENROUTER_SITE_URL` - (Optional) Your site URL for OpenRouter rankings
 - `OPENROUTER_SITE_NAME` - (Optional) Your site name for OpenRouter rankings
 
@@ -233,13 +232,27 @@ For more details, see [docs/TRAJECTORY_RECORDING.md](docs/TRAJECTORY_RECORDING.m
 For detailed contribution guidelines, please refer to [CONTRIBUTING.md](CONTRIBUTING.md).
 
 1. Fork the repository
-2. Set up a development install(`make install-dev pre-commit-install`)
+2. Set up a development install:
+   ```bash
+   make install-dev
+   ```
 3. Create a feature branch (`git checkout -b feature/amazing-feature`)
 4. Make your changes
 5. Add tests for new functionality
-6. Commit your changes (`git commit -m 'Add amazing feature'`)
-7. Push to the branch (`git push origin feature/amazing-feature`)
-8. Open a Pull Request
+6. Pre-commit check
+   ```bash
+    make pre-commit
+    or:
+    make uv-pre-commit
+   ```
+    if having formatting error,please try:
+   ```
+    make fix-format
+   ```
+
+7. Commit your changes (`git commit -m 'Add amazing feature'`)
+8. Push to the branch (`git push origin feature/amazing-feature`)
+9. Open a Pull Request
 
 ### Development Guidelines
 
@@ -277,7 +290,6 @@ echo $OPENAI_API_KEY
 echo $ANTHROPIC_API_KEY
 echo $GOOGLE_API_KEY
 echo $OPENROUTER_API_KEY
-echo $GOOGLE_API_KEY
 
 # Check configuration
 trae-cli show-config
