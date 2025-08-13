@@ -4,9 +4,6 @@
 """Google Gemini API client wrapper with tool integration."""
 
 import json
-import os
-import random
-import time
 import traceback
 import uuid
 from typing import override
@@ -14,27 +11,18 @@ from typing import override
 from google import genai
 from google.genai import types
 
-from ..tools.base import Tool, ToolCall, ToolResult
-from .base_client import BaseLLMClient
-from .config import ModelParameters
-from .llm_basics import LLMMessage, LLMResponse, LLMUsage
+from trae_agent.tools.base import Tool, ToolCall, ToolResult
+from trae_agent.utils.config import ModelConfig
+from trae_agent.utils.llm_clients.base_client import BaseLLMClient
+from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
+from trae_agent.utils.llm_clients.retry_utils import retry_with
 
 
 class GoogleClient(BaseLLMClient):
     """Google Gemini client wrapper with tool schema generation."""
 
-    def __init__(self, model_parameters: ModelParameters):
-        super().__init__(model_parameters)
-
-        if self.api_key == "":
-            google_api_key = os.getenv("GOOGLE_API_KEY")
-            if google_api_key:
-                self.api_key = google_api_key
-
-        if self.api_key == "":
-            raise ValueError(
-                "Google API key not provided. Set GOOGLE_API_KEY in environment variables or config file."
-            )
+    def __init__(self, model_config: ModelConfig):
+        super().__init__(model_config)
 
         self.client = genai.Client(api_key=self.api_key)
         self.message_history: list[types.Content] = []
@@ -45,11 +33,24 @@ class GoogleClient(BaseLLMClient):
         """Set the chat history."""
         self.message_history, self.system_instruction = self.parse_messages(messages)
 
+    def _create_google_response(
+        self,
+        model_config: ModelConfig,
+        current_chat_contents: list[types.Content],
+        generation_config: types.GenerateContentConfig,
+    ) -> types.GenerateContentResponse:
+        """Create a response using Google Gemini API. This method will be decorated with retry logic."""
+        return self.client.models.generate_content(  # pyright: ignore[reportUnknownMemberType]
+            model=model_config.model,
+            contents=current_chat_contents,
+            config=generation_config,
+        )
+
     @override
     def chat(
         self,
         messages: list[LLMMessage],
-        model_parameters: ModelParameters,
+        model_config: ModelConfig,
         tools: list[Tool] | None = None,
         reuse_history: bool = True,
     ) -> LLMResponse:
@@ -63,53 +64,40 @@ class GoogleClient(BaseLLMClient):
         else:
             current_chat_contents = newly_parsed_messages
 
+        # Set up generation config
         generation_config = types.GenerateContentConfig(
-            temperature=model_parameters.temperature,
-            top_p=model_parameters.top_p,
-            top_k=model_parameters.top_k,
-            max_output_tokens=model_parameters.max_tokens,
-            candidate_count=model_parameters.candidate_count or 1,
-            stop_sequences=model_parameters.stop_sequences,
+            temperature=model_config.temperature,
+            top_p=model_config.top_p,
+            top_k=model_config.top_k,
+            max_output_tokens=model_config.max_tokens,
+            candidate_count=model_config.candidate_count,
+            stop_sequences=model_config.stop_sequences,
             system_instruction=current_system_instruction,
         )
 
+        # Add tools if provided
         if tools:
-            try:
-                declarations = [
-                    types.FunctionDeclaration(
-                        name=tool.name,
-                        description=tool.description,
-                        parameters=tool.get_input_schema(),
-                    )
-                    for tool in tools
-                ]
-                generation_config.tools = [types.Tool(function_declarations=declarations)]
-            except Exception as e:
-                tb = traceback.format_exc()
-                raise ValueError(
-                    f"Failed to convert tools into Gemini FunctionDeclarations: {e}\n{tb}"
-                ) from e
-
-        response = None
-        error_message = ""
-        for i in range(model_parameters.max_retries):
-            try:
-                response = self.client.models.generate_content(
-                    model=model_parameters.model,
-                    contents=current_chat_contents,
-                    config=generation_config,
+            tool_schemas = [
+                types.Tool(
+                    function_declarations=[
+                        types.FunctionDeclaration(
+                            name=tool.get_name(),
+                            description=tool.get_description(),
+                            parameters=tool.get_input_schema(),  # pyright: ignore[reportArgumentType]
+                        )
+                    ]
                 )
-                break
-            except Exception as e:
-                tb = traceback.format_exc()
-                error_message += f"Error {i + 1}: {str(e)}\nTraceback:\n{tb}\n"
-                time.sleep(random.randint(3, 30))
-                continue
+                for tool in tools
+            ]
+            generation_config.tools = tool_schemas
 
-        if response is None:
-            raise ValueError(
-                f"Failed to get response from Gemini after max retries: {error_message}"
-            )
+        # Apply retry decorator to the API call
+        retry_decorator = retry_with(
+            func=self._create_google_response,
+            provider_name="Google Gemini",
+            max_retries=model_config.max_retries,
+        )
+        response = retry_decorator(model_config, current_chat_contents, generation_config)
 
         content = ""
         tool_calls: list[ToolCall] = []
@@ -126,7 +114,7 @@ class GoogleClient(BaseLLMClient):
                         tool_calls.append(
                             ToolCall(
                                 call_id=str(uuid.uuid4()),
-                                name=part.function_call.name,
+                                name=part.function_call.name or "tool",
                                 arguments=dict(part.function_call.args)
                                 if part.function_call.args
                                 else {},
@@ -158,8 +146,12 @@ class GoogleClient(BaseLLMClient):
         llm_response = LLMResponse(
             content=content,
             usage=usage,
-            model=model_parameters.model,
-            finish_reason=str(response.candidates[0].finish_reason.name)
+            model=model_config.model,
+            finish_reason=str(
+                response.candidates[0].finish_reason.name
+                if response.candidates[0].finish_reason
+                else "unknown"
+            )
             if response.candidates
             else "UNKNOWN",
             tool_calls=tool_calls if len(tool_calls) > 0 else None,
@@ -170,22 +162,11 @@ class GoogleClient(BaseLLMClient):
                 messages=messages,
                 response=llm_response,
                 provider="google",
-                model=model_parameters.model,
+                model=model_config.model,
                 tools=tools,
             )
 
         return llm_response
-
-    @override
-    def supports_tool_calling(self, model_parameters: ModelParameters) -> bool:
-        """Check if the current model supports tool calling."""
-        tool_capable_models = [
-            "gemini-2.5-pro",
-            "gemini-2.5-flash",
-            "gemini-2.5-flash-lite",
-            "gemini-2.0-flash",
-        ]
-        return any(model_name in model_parameters.model for model_name in tool_capable_models)
 
     def parse_messages(self, messages: list[LLMMessage]) -> tuple[list[types.Content], str | None]:
         """Parse the messages to Gemini format, separating system instructions."""
@@ -221,21 +202,18 @@ class GoogleClient(BaseLLMClient):
 
     def parse_tool_call_result(self, tool_result: ToolResult) -> types.Part:
         """Parse a ToolResult into a Gemini FunctionResponse Part for history."""
-        result_content = {}
+        result_content: dict[str, str] = {}
         if tool_result.result is not None:
-            if isinstance(tool_result.result, (str, int, float, bool, list, dict)):
-                try:
-                    json.dumps(tool_result.result)
-                    result_content["result"] = tool_result.result
-                except (TypeError, OverflowError) as e:
-                    tb = traceback.format_exc()
-                    serialization_error = f"JSON serialization failed for tool result: {e}\n{tb}"
-                    if tool_result.error:
-                        result_content["error"] = f"{tool_result.error}\n\n{serialization_error}"
-                    else:
-                        result_content["error"] = serialization_error
-                    result_content["result"] = str(tool_result.result)
-            else:
+            try:
+                json.dumps(tool_result.result)
+                result_content["result"] = tool_result.result
+            except (TypeError, OverflowError) as e:
+                tb = traceback.format_exc()
+                serialization_error = f"JSON serialization failed for tool result: {e}\n{tb}"
+                if tool_result.error:
+                    result_content["error"] = f"{tool_result.error}\n\n{serialization_error}"
+                else:
+                    result_content["error"] = serialization_error
                 result_content["result"] = str(tool_result.result)
 
         if tool_result.error and "error" not in result_content:
@@ -248,5 +226,4 @@ class GoogleClient(BaseLLMClient):
             raise AttributeError(
                 "ToolResult must have a 'name' attribute matching the function that was called."
             )
-
         return types.Part.from_function_response(name=tool_result.name, response=result_content)

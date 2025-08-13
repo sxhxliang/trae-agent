@@ -11,7 +11,7 @@ from jsonpath_ng import Fields, Index
 from jsonpath_ng import parse as jsonpath_parse
 from jsonpath_ng.exceptions import JSONPathError
 
-from .base import Tool, ToolCallArguments, ToolError, ToolExecResult, ToolParameter
+from trae_agent.tools.base import Tool, ToolCallArguments, ToolError, ToolExecResult, ToolParameter
 
 
 class JSONEditTool(Tool):
@@ -66,7 +66,7 @@ JSONPath syntax supported:
             ToolParameter(
                 name="file_path",
                 type="string",
-                description="Absolute path to the JSON file to edit.",
+                description="The full, ABSOLUTE path to the JSON file to edit. You MUST combine the [Project root path] with the file's relative path to construct this. Relative paths are NOT allowed.",
                 required=True,
             ),
             ToolParameter(

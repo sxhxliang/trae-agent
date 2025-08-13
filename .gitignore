@@ -93,6 +93,9 @@ target/
 profile_default/
 ipython_config.py
 
+# Node stuff:
+.node_modules/
+
 # pyenv
 #   For a library or package, you might want to ignore these files since the code is
 #   intended to run in multiple environments; otherwise, check them in:
@@ -170,5 +173,13 @@ cython_debug/
 #  files for the tool.
 #.idea/
 
-trajectory_*.json
 trae-config-local.json
+trae_config.json
+trae_config.yaml
+
+# Trajectories
+/trajectories/
+
+# VS Code settings
+.vscode/
+!.vscode/launch.template.json

@@ -9,13 +9,14 @@ import traceback
 from pathlib import Path
 from typing import Any
 
-from datasets import load_dataset
-from docker import from_env
+from datasets import load_dataset  # pyright: ignore
+from docker import DockerClient, from_env
 from docker.errors import ImageNotFound
+from docker.models.containers import Container, ExecResult
 from tqdm import tqdm
 
 
-def docker_exec(container, command: str):
+def docker_exec(container: Container, command: str):
     """
     Execute a command in a docker container.
 
@@ -26,7 +27,7 @@ def docker_exec(container, command: str):
     Returns:
         A tuple of (return_code, output).
     """
-    exec_result = container.exec_run(cmd=command)
+    exec_result: ExecResult = container.exec_run(cmd=command)  # pyright: ignore[reportUnknownMemberType]
     return_code = exec_result[0]
     output = exec_result[1].decode("utf-8")
     return return_code, output
@@ -40,7 +41,7 @@ class SWEBenchEvaluation:
         dataset: str = "SWE-bench_Verified",
         docker_env_config: str = "",
         swebench_harness_path: str = "",
-        run_id="trae-agent",
+        run_id: str = "trae-agent",
     ):
         """
         Initialize the SWEBenchEvaluation class. The initialisation includes checking the existence of required Docker images and downloading missing images.
@@ -59,7 +60,7 @@ class SWEBenchEvaluation:
         self.dataset = load_dataset(f"princeton-nlp/{dataset}", split="test")
         self.dataset_name = dataset
 
-        self.docker_client = from_env()
+        self.docker_client: DockerClient = from_env()
         self.image_status: dict[Any, Any] = {}
         self.working_dir = Path(working_dir)
         self.swebench_harness_path = swebench_harness_path
@@ -67,7 +68,7 @@ class SWEBenchEvaluation:
 
         if docker_env_config != "":
             with open(docker_env_config, "r") as f:
-                self.docker_env_config = json.load(f)
+                self.docker_env_config: dict[str, dict[str, str]] = json.load(f)
         else:
             self.docker_env_config = {}
 
@@ -98,9 +99,9 @@ class SWEBenchEvaluation:
         """
         Check the existence of required Docker images.
         """
-        for item in tqdm(self.dataset, desc="Checking image status"):
-            instance_id = item["instance_id"]
-            image_name = self._image_name(instance_id)
+        for item in tqdm(self.dataset, desc="Checking image status"):  # pyright: ignore[reportUnknownVariableType]
+            instance_id: str = item["instance_id"]  # pyright: ignore[reportUnknownVariableType]
+            image_name = self._image_name(instance_id)  # pyright: ignore[reportUnknownArgumentType]
             try:
                 _ = self.docker_client.images.get(image_name)
                 self.image_status[instance_id] = True
@@ -148,21 +149,28 @@ class SWEBenchEvaluation:
         except Exception:
             image = self.docker_client.images.pull("ubuntu:22.04")
 
+        repo_root_path = Path(__file__).parent.parent
+        assert (repo_root_path / "trae_agent" / "__init__.py").is_file()
+
         container = self.docker_client.containers.run(
-            image,
+            image=image,
             command="bash",
             detach=True,
             tty=True,
             stdin_open=True,
-            volumes={self.working_dir.absolute(): {"bind": "/trae-workspace", "mode": "rw"}},
-            environment=self.docker_env_config.get("preparation_env", None),
+            volumes={
+                self.working_dir.absolute().as_posix(): {"bind": "/trae-workspace", "mode": "rw"},
+                repo_root_path.absolute().as_posix(): {"bind": "/trae-src", "mode": "ro"},
+            },
+            environment=self.docker_env_config.get("preparation_env", None),  # pyright: ignore[reportUnknownMemberType]
         )
 
         commands = [
             "apt-get update",
-            "apt-get install -y curl git",
+            "apt-get install -y curl",
             "curl -LsSf https://astral.sh/uv/install.sh | sh",
-            "git clone https://github.com/bytedance/trae-agent.git /trae-workspace/trae-agent",
+            "rm -rf /trae-workspace/trae-agent && mkdir /trae-workspace/trae-agent",
+            "cp -r -t /trae-workspace/trae-agent/ /trae-src/trae_agent /trae-src/.python-version /trae-src/pyproject.toml /trae-src/uv.lock /trae-src/README.md",
             "cd /trae-workspace/trae-agent && source $HOME/.local/bin/env && uv sync",
         ]
 
@@ -196,7 +204,7 @@ class SWEBenchEvaluation:
         container.stop()
         container.remove()
 
-    def prepare_experiment_container(self, instance):
+    def prepare_experiment_container(self, instance: dict[str, str]) -> Container:
         """
         Prepare an experiment Docker container for a given instance.
 
@@ -214,13 +222,15 @@ class SWEBenchEvaluation:
         with open(instance_dir / "problem_statement.txt", "w") as f:
             f.write(instance["problem_statement"])
 
-        container = self.docker_client.containers.run(
+        container: Container = self.docker_client.containers.run(
             image_name,
             command="/bin/bash",
             detach=True,
             tty=True,
             stdin_open=True,
-            volumes={self.working_dir.absolute(): {"bind": "/trae-workspace", "mode": "rw"}},
+            volumes={
+                self.working_dir.absolute().as_posix(): {"bind": "/trae-workspace", "mode": "rw"}
+            },
             working_dir="/trae-workspace",
             environment=self.docker_env_config.get("experiment_env", None),
             stream=True,
@@ -248,17 +258,17 @@ class SWEBenchEvaluation:
                 break
         return container
 
-    def run_one_instance(self, instance_id):
+    def run_one_instance(self, instance_id: str):
         """
         Run a single instance using the prepared experiment container.
 
         Args:
             instance_id: The ID of the instance to run.
         """
-        instance = None
-        for inst in self.dataset:
-            if inst["instance_id"] == instance_id:
-                instance = inst
+        instance: dict[str, str] | None = None
+        for inst in self.dataset:  # pyright: ignore[reportUnknownVariableType]
+            if inst["instance_id"] == instance_id:  # pyright: ignore
+                instance = inst  # pyright: ignore
         if instance is None:
             print(f"Instance {instance_id} not found.")
             return
@@ -268,7 +278,7 @@ class SWEBenchEvaluation:
         problem_statement_path = instance_dir + "/problem_statement.txt"
         patch_file_path = instance_dir + f"/{instance['instance_id']}.patch"
         traj_path = instance_dir + f"/{instance['instance_id']}.json"
-        command = f'source trae-agent/.venv/bin/activate && trae-cli run {problem_statement_path} --working-dir="/testbed/" --config-file trae_config_local.json --max-steps 200 --must-patch --patch-path {patch_file_path} --trajectory-file {traj_path}'
+        command = f'source trae-agent/.venv/bin/activate && trae-cli run --file {problem_statement_path} --working-dir="/testbed/" --config-file trae_config_local.json --max-steps 200 --must-patch --patch-path {patch_file_path} --trajectory-file {traj_path}'
         new_command = f"/bin/bash -c '{command}'"
 
         try:
@@ -285,8 +295,8 @@ class SWEBenchEvaluation:
         """
         Run all instances in the dataset.
         """
-        for instance in tqdm(self.dataset, desc="Running all instances"):
-            self.run_one_instance(instance)
+        for instance in tqdm(self.dataset, desc="Running all instances"):  # pyright: ignore
+            self.run_one_instance(instance["instance_id"])  # pyright: ignore
 
     def run_eval(self):
         """
@@ -325,9 +335,9 @@ class SWEBenchEvaluation:
         Args:
             instance_ids: A list of instance IDs. If None, all instances in the dataset will be used.
         """
-        preds = []
+        preds: list[dict[str, str]] = []
         if not instance_ids:
-            instance_ids = [instance["instance_id"] for instance in self.dataset]
+            instance_ids = [instance["instance_id"] for instance in self.dataset]  # pyright: ignore
         for instance_id in instance_ids:
             patch_path = self.working_dir / instance_id / f"{instance_id}.patch"
             if not patch_path.exists():

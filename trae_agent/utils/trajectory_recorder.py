@@ -13,8 +13,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from ..tools.base import ToolCall, ToolResult
-from .llm_basics import LLMMessage, LLMResponse
+from trae_agent.tools.base import ToolCall, ToolResult
+from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse
 
 
 class TrajectoryRecorder:
@@ -28,9 +28,14 @@ class TrajectoryRecorder:
         """
         if trajectory_path is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            trajectory_path = f"trajectory_{timestamp}.json"
+            trajectory_path = f"trajectories/trajectory_{timestamp}.json"
 
-        self.trajectory_path: Path = Path(trajectory_path)
+        self.trajectory_path: Path = Path(trajectory_path).resolve()
+        try:
+            self.trajectory_path.parent.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            print("Error creating trajectory directory. Trajectories may not be properly saved.")
+
         self.trajectory_data: dict[str, Any] = {
             "task": "",
             "start_time": "",
@@ -96,8 +101,8 @@ class TrajectoryRecorder:
                 "model": response.model,
                 "finish_reason": response.finish_reason,
                 "usage": {
-                    "input_tokens": response.usage.input_tokens if response.usage else None,
-                    "output_tokens": response.usage.output_tokens if response.usage else None,
+                    "input_tokens": response.usage.input_tokens if response.usage else 0,
+                    "output_tokens": response.usage.output_tokens if response.usage else 0,
                     "cache_creation_input_tokens": getattr(
                         response.usage, "cache_creation_input_tokens", None
                     )
@@ -181,6 +186,13 @@ class TrajectoryRecorder:
         }
 
         self.trajectory_data["agent_steps"].append(step_data)
+        self.save_trajectory()
+
+    def update_lakeview(self, step_number: int, lakeview_summary: str):
+        for step_data in self.trajectory_data["agent_steps"]:
+            if step_data["step_number"] == step_number:
+                step_data["lakeview_summary"] = lakeview_summary
+                break
         self.save_trajectory()
 
     def finalize_recording(self, success: bool, final_result: str | None = None) -> None:

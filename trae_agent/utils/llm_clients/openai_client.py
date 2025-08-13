@@ -4,43 +4,31 @@
 """OpenAI API client wrapper with tool integration."""
 
 import json
-import os
-import random
-import time
 from typing import override
 
 import openai
 from openai.types.responses import (
+    EasyInputMessageParam,
     FunctionToolParam,
+    Response,
     ResponseFunctionToolCallParam,
     ResponseInputParam,
+    ToolParam,
 )
 from openai.types.responses.response_input_param import FunctionCallOutput
 
-from ..tools.base import Tool, ToolCall, ToolResult
-from ..utils.config import ModelParameters
-from .base_client import BaseLLMClient
-from .llm_basics import LLMMessage, LLMResponse, LLMUsage
+from trae_agent.tools.base import Tool, ToolCall, ToolResult
+from trae_agent.utils.config import ModelConfig
+from trae_agent.utils.llm_clients.base_client import BaseLLMClient
+from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse, LLMUsage
+from trae_agent.utils.llm_clients.retry_utils import retry_with
 
 
 class OpenAIClient(BaseLLMClient):
     """OpenAI client wrapper with tool schema generation."""
 
-    def __init__(self, model_parameters: ModelParameters):
-        super().__init__(model_parameters)
-
-        if self.api_key == "":
-            self.api_key: str = os.getenv("OPENAI_API_KEY", "")
-
-        if self.api_key == "":
-            raise ValueError(
-                "OpenAI API key not provided. Set OPENAI_API_KEY in environment variables or config file."
-            )
-
-        if "OPENAI_BASE_URL" in os.environ:
-            # If OPENAI_BASE_URL is set, which means the user wants to use a specific openai compatible api provider,
-            # we should use the base url from the environment variable
-            self.base_url = os.environ["OPENAI_BASE_URL"]
+    def __init__(self, model_config: ModelConfig):
+        super().__init__(model_config)
 
         self.client: openai.OpenAI = openai.OpenAI(api_key=self.api_key, base_url=self.base_url)
         self.message_history: ResponseInputParam = []
@@ -50,11 +38,31 @@ class OpenAIClient(BaseLLMClient):
         """Set the chat history."""
         self.message_history = self.parse_messages(messages)
 
+    def _create_openai_response(
+        self,
+        api_call_input: ResponseInputParam,
+        model_config: ModelConfig,
+        tool_schemas: list[ToolParam] | None,
+    ) -> Response:
+        """Create a response using OpenAI API. This method will be decorated with retry logic."""
+        return self.client.responses.create(
+            input=api_call_input,
+            model=model_config.model,
+            tools=tool_schemas if tool_schemas else openai.NOT_GIVEN,
+            temperature=model_config.temperature
+            if "o3" not in model_config.model
+            and "o4-mini" not in model_config.model
+            and "gpt-5" not in model_config.model
+            else openai.NOT_GIVEN,
+            top_p=model_config.top_p,
+            max_output_tokens=model_config.max_tokens,
+        )
+
     @override
     def chat(
         self,
         messages: list[LLMMessage],
-        model_parameters: ModelParameters,
+        model_config: ModelConfig,
         tools: list[Tool] | None = None,
         reuse_history: bool = True,
     ) -> LLMResponse:
@@ -79,34 +87,13 @@ class OpenAIClient(BaseLLMClient):
             api_call_input.extend(self.message_history)
         api_call_input.extend(openai_messages)
 
-        response = None
-        error_message = ""
-        for i in range(model_parameters.max_retries):
-            try:
-                response = self.client.responses.create(
-                    input=api_call_input,
-                    model=model_parameters.model,
-                    tools=tool_schemas if tool_schemas else openai.NOT_GIVEN,
-                    temperature=model_parameters.temperature
-                    if "o3" not in model_parameters.model
-                    and "o4-mini" not in model_parameters.model
-                    else openai.NOT_GIVEN,
-                    top_p=model_parameters.top_p,
-                    max_output_tokens=model_parameters.max_tokens,
-                )
-                break
-            except Exception as e:
-                error_message += f"Error {i + 1}: {str(e)}\n"
-                # Randomly sleep for 3-30 seconds
-                time.sleep(random.randint(3, 30))
-                continue
-
-        if response is None:
-            raise ValueError(
-                f"Failed to get response from OpenAI after max retries: {error_message}"
-            )
-
-        self.message_history = api_call_input + response.output
+        # Apply retry decorator to the API call
+        retry_decorator = retry_with(
+            func=self._create_openai_response,
+            provider_name="OpenAI",
+            max_retries=model_config.max_retries,
+        )
+        response = retry_decorator(api_call_input, model_config, tool_schemas)
 
         content = ""
         tool_calls: list[ToolCall] = []
@@ -122,6 +109,17 @@ class OpenAIClient(BaseLLMClient):
                         id=output_block.id,
                     )
                 )
+                tool_call_param = ResponseFunctionToolCallParam(
+                    arguments=output_block.arguments,
+                    call_id=output_block.call_id,
+                    name=output_block.name,
+                    type="function_call",
+                )
+                if output_block.status:
+                    tool_call_param["status"] = output_block.status
+                if output_block.id:
+                    tool_call_param["id"] = output_block.id
+                self.message_history.append(tool_call_param)
             elif output_block.type == "message":
                 content = "".join(
                     content_block.text
@@ -129,13 +127,18 @@ class OpenAIClient(BaseLLMClient):
                     if content_block.type == "output_text"
                 )
 
+        if content != "":
+            self.message_history.append(
+                EasyInputMessageParam(content=content, role="assistant", type="message")
+            )
+
         usage = None
         if response.usage:
             usage = LLMUsage(
-                input_tokens=response.usage.input_tokens,
-                output_tokens=response.usage.output_tokens,
-                cache_read_input_tokens=response.usage.input_tokens_details.cached_tokens,
-                reasoning_tokens=response.usage.output_tokens_details.reasoning_tokens,
+                input_tokens=response.usage.input_tokens or 0,
+                output_tokens=response.usage.output_tokens or 0,
+                cache_read_input_tokens=response.usage.input_tokens_details.cached_tokens or 0,
+                reasoning_tokens=response.usage.output_tokens_details.reasoning_tokens or 0,
             )
 
         llm_response = LLMResponse(
@@ -152,31 +155,11 @@ class OpenAIClient(BaseLLMClient):
                 messages=messages,
                 response=llm_response,
                 provider="openai",
-                model=model_parameters.model,
+                model=model_config.model,
                 tools=tools,
             )
 
         return llm_response
-
-    @override
-    def supports_tool_calling(self, model_parameters: ModelParameters) -> bool:
-        """Check if the current model supports tool calling."""
-
-        if "o1-mini" in model_parameters.model:
-            return False
-
-        tool_capable_models = [
-            "gpt-4-turbo",
-            "gpt-4o",
-            "gpt-4o-mini",
-            "gpt-4.1",
-            "gpt-4.5",
-            "o1",
-            "o3",
-            "o3-mini",
-            "o4-mini",
-        ]
-        return any(model in model_parameters.model for model in tool_capable_models)
 
     def parse_messages(self, messages: list[LLMMessage]) -> ResponseInputParam:
         """Parse the messages to OpenAI format."""

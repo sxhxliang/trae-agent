@@ -15,6 +15,14 @@ dependencies = [
     "rich>=13.0.0",
     "typing-extensions>=4.0.0",
     "ollama>=0.5.1",
+    "socksio>=1.0.0",
+    "tree-sitter-languages==1.10.2",
+    "tree-sitter==0.21.3",
+    "ruff>=0.12.4",
+    "mcp==1.12.2",
+    "asyncclick>=8.0.0",
+    "pyyaml>=6.0.2",
+    "textual>=0.50.0",
 ]
 
 [project.optional-dependencies]
@@ -82,4 +90,9 @@ select = [
     "C4",
     "E4", "E9", "E7", "F",
     "I"
+]
+
+[dependency-groups]
+dev = [
+    "types-pyyaml>=6.0.12.20250516",
 ]
