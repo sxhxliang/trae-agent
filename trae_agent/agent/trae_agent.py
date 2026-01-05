@@ -4,18 +4,19 @@
 """TraeAgent for software engineering tasks."""
 
 import asyncio
+import contextlib
 import os
 import subprocess
 from typing import override
 
-from ..prompt.agent_prompt import TRAE_AGENT_SYSTEM_PROMPT
-from ..tools import tools_registry
-from ..tools.base import Tool, ToolExecutor, ToolResult
-from ..utils.config import Config
-from ..utils.llm_basics import LLMMessage, LLMResponse
-from ..utils.llm_client import LLMClient
-from .agent_basics import AgentError, AgentExecution
-from .base import Agent
+from trae_agent.agent.agent_basics import AgentError, AgentExecution
+from trae_agent.agent.base_agent import BaseAgent
+from trae_agent.prompt.agent_prompt import TRAE_AGENT_SYSTEM_PROMPT
+from trae_agent.tools import tools_registry
+from trae_agent.tools.base import Tool, ToolResult
+from trae_agent.utils.config import MCPServerConfig, TraeAgentConfig
+from trae_agent.utils.llm_clients.llm_basics import LLMMessage, LLMResponse
+from trae_agent.utils.mcp_client import MCPClient
 
 TraeAgentToolNames = [
     "str_replace_based_edit_tool",
@@ -26,10 +27,15 @@ TraeAgentToolNames = [
 ]
 
 
-class TraeAgent(Agent):
+class TraeAgent(BaseAgent):
     """Trae Agent specialized for software engineering tasks."""
 
-    def __init__(self, config: Config | None = None, llm_client: LLMClient | None = None):
+    def __init__(
+        self,
+        trae_agent_config: TraeAgentConfig,
+        docker_config: dict | None = None,
+        docker_keep: bool = True,
+    ):
         """Initialize TraeAgent.
 
         Args:
@@ -37,44 +43,61 @@ class TraeAgent(Agent):
                    Required if llm_client is not provided.
             llm_client: Optional pre-configured LLMClient instance.
                        If provided, it will be used instead of creating a new one from config.
+            docker_config: Optional configuration for running in a Docker environment.
         """
         self.project_path: str = ""
         self.base_commit: str | None = None
         self.must_patch: str = "false"
         self.patch_path: str | None = None
-        super().__init__(config=config, llm_client=llm_client)
+        self.mcp_servers_config: dict[str, MCPServerConfig] | None = (
+            trae_agent_config.mcp_servers_config if trae_agent_config.mcp_servers_config else None
+        )
+        self.allow_mcp_servers: list[str] | None = (
+            trae_agent_config.allow_mcp_servers if trae_agent_config.allow_mcp_servers else []
+        )
+        self.mcp_tools: list[Tool] = []
+        self.mcp_clients: list[MCPClient] = []  # Keep track of MCP clients for cleanup
+        self.docker_config = docker_config
+        super().__init__(
+            agent_config=trae_agent_config, docker_config=docker_config, docker_keep=docker_keep
+        )
 
-    @classmethod
-    @override
-    def from_config(cls, config: Config) -> "TraeAgent":
-        """Create a TraeAgent instance from a configuration object.
+    async def initialise_mcp(self):
+        """Async factory to create and initialize TraeAgent."""
+        await self.discover_mcp_tools()
 
-        This factory method provides the traditional config-based initialization
-        while allowing for future customization of the instantiation process.
+        if self.mcp_tools:
+            self._tools.extend(self.mcp_tools)
 
-        Args:
-            config: Configuration object containing model parameters and other settings.
-
-        Returns:
-            An instance of TraeAgent.
-        """
-        return cls(config=config)
-
-    def setup_trajectory_recording(self, trajectory_path: str | None = None) -> str:
-        """Set up trajectory recording for this agent.
-
-        Args:
-            trajectory_path: Path to save trajectory file. If None, generates default path.
-
-        Returns:
-            The path where trajectory will be saved.
-        """
-        from ..utils.trajectory_recorder import TrajectoryRecorder
-
-        recorder = TrajectoryRecorder(trajectory_path)
-        self._set_trajectory_recorder(recorder)
-
-        return recorder.get_trajectory_path()
+    async def discover_mcp_tools(self):
+        if self.mcp_servers_config:
+            for mcp_server_name, mcp_server_config in self.mcp_servers_config.items():
+                if self.allow_mcp_servers is None:
+                    return
+                if mcp_server_name not in self.allow_mcp_servers:
+                    continue
+                mcp_client = MCPClient()
+                try:
+                    await mcp_client.connect_and_discover(
+                        mcp_server_name,
+                        mcp_server_config,
+                        self.mcp_tools,
+                        self._llm_client.provider.value,
+                    )
+                    # Store client for later cleanup
+                    self.mcp_clients.append(mcp_client)
+                except Exception:
+                    # Clean up failed client
+                    with contextlib.suppress(Exception):
+                        await mcp_client.cleanup(mcp_server_name)
+                    continue
+                except asyncio.CancelledError:
+                    # If the task is cancelled, clean up and skip this server
+                    with contextlib.suppress(Exception):
+                        await mcp_client.cleanup(mcp_server_name)
+                    continue
+        else:
+            return
 
     @override
     def new_task(
@@ -86,15 +109,15 @@ class TraeAgent(Agent):
         """Create a new task."""
         self._task: str = task
 
-        if tool_names is None:
+        if tool_names is None and len(self._tools) == 0:
             tool_names = TraeAgentToolNames
 
-        # Get the model provider from the LLM client
-        provider = self._llm_client.provider.value
-        self._tools: list[Tool] = [
-            tools_registry[tool_name](model_provider=provider) for tool_name in tool_names
-        ]
-        self._tool_caller: ToolExecutor = ToolExecutor(self._tools)
+            # Get the model provider from the LLM client
+            provider = self._model_config.model_provider.provider
+            self._tools: list[Tool] = [
+                tools_registry[tool_name](model_provider=provider) for tool_name in tool_names
+            ]
+        # self._tool_caller: ToolExecutor = ToolExecutor(self._tools)
 
         self._initial_messages: list[LLMMessage] = []
         self._initial_messages.append(LLMMessage(role="system", content=self.get_system_prompt()))
@@ -106,7 +129,10 @@ class TraeAgent(Agent):
             raise AgentError("Project path is required")
 
         self.project_path = extra_args.get("project_path", "")
-        user_message += f"[Project root path]:\n{self.project_path}\n\n"
+        if self.docker_config:
+            user_message += r"[Project root path]:\workspace\n\n"
+        else:
+            user_message += f"[Project root path]:\n{self.project_path}\n\n"
 
         if "issue" in extra_args:
             user_message += f"[Problem statement]: We're currently solving the following issue within our repository. Here's the issue text:\n{extra_args['issue']}\n"
@@ -122,17 +148,14 @@ class TraeAgent(Agent):
             self._trajectory_recorder.start_recording(
                 task=task,
                 provider=self._llm_client.provider.value,
-                model=self._model_parameters.model,
+                model=self._model_config.model,
                 max_steps=self._max_steps,
             )
 
     @override
     async def execute_task(self) -> AgentExecution:
         """Execute the task and finalize trajectory recording."""
-        console_task = asyncio.create_task(self._cli_console.start()) if self._cli_console else None
         execution = await super().execute_task()
-        if self._cli_console and console_task and not console_task.done():
-            await console_task
 
         # Finalize trajectory recording if recorder is available
         if self._trajectory_recorder:
@@ -142,7 +165,7 @@ class TraeAgent(Agent):
 
         if self.patch_path is not None:
             with open(self.patch_path, "w") as patch_f:
-                patch_f.write(self.get_git_diff())
+                _ = patch_f.write(self.get_git_diff())
 
         return execution
 
@@ -224,3 +247,12 @@ class TraeAgent(Agent):
     def task_incomplete_message(self) -> str:
         """Return a message indicating that the task is incomplete."""
         return "ERROR! Your Patch is empty. Please provide a patch that fixes the problem."
+
+    @override
+    async def cleanup_mcp_clients(self) -> None:
+        """Clean up all MCP clients to prevent async context leaks."""
+        for client in self.mcp_clients:
+            with contextlib.suppress(Exception):
+                # Use a generic server name for cleanup since we don't track which server each client is for
+                await client.cleanup("cleanup")
+        self.mcp_clients.clear()
